@@ -28,6 +28,7 @@ struct OutputTemplate {
     types: Vec<OutputMimeType>,
     type_map: HashMap<String, Vec<String>>,
     ext_map: HashMap<String, Vec<String>>,
+    regex_patterns: Vec<String>,
 }
 
 fn mime_to_short_name(mime_type: &str) -> String {
@@ -238,7 +239,9 @@ fn match_to_rule(mat: &Match) -> MatchRule {
             (Some(Offset::Start(start)), Some(value)) => {
                 // Test the regex pattern, we don't support some features
                 println!("Testing regex pattern: {}", value);
-                match Regex::new(value) {
+                // Unescape double backslashes for proper regex testing
+                let unescaped_pattern = value.replace("\\\\", "\\");
+                match Regex::new(&unescaped_pattern) {
                     Ok(reg) => {
                         reg.is_match(&[0, 1, 2, 3, 4, 5, 6, 7]);
                     }
@@ -251,7 +254,9 @@ fn match_to_rule(mat: &Match) -> MatchRule {
                 MatchRule::Regex(*start, value.to_string())
             }
             (Some(Offset::Range { start, end }), Some(value)) => {
-                match Regex::new(value) {
+                // Unescape double backslashes for proper regex testing
+                let unescaped_pattern = value.replace("\\\\", "\\");
+                match Regex::new(&unescaped_pattern) {
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("Error: Invalid regex pattern: {}", e);
@@ -385,15 +390,27 @@ fn actions_to_rules(mime: &MimeType) -> MatchRule {
     }
 }
 
-fn rules_to_string(match_rule: &MatchRule) -> String {
+fn get_or_add_regex_pattern(regex_patterns: &mut Vec<String>, pattern: &str) -> usize {
+    // Unescape double backslashes to single backslashes for proper regex interpretation
+    let unescaped_pattern = pattern.replace("\\\\", "\\");
+    
+    if let Some(index) = regex_patterns.iter().position(|p| p == &unescaped_pattern) {
+        index
+    } else {
+        regex_patterns.push(unescaped_pattern);
+        regex_patterns.len() - 1
+    }
+}
+
+fn rules_to_string(match_rule: &MatchRule, regex_patterns: &mut Vec<String>) -> String {
     match match_rule {
         MatchRule::Or(rules) => {
-            let strings = rules.iter().map(rules_to_string).collect::<Vec<String>>();
+            let strings = rules.iter().map(|r| rules_to_string(r, regex_patterns)).collect::<Vec<String>>();
             let joined = strings.join(" || ");
             format!("({})", joined)
         }
         MatchRule::And(rules) => {
-            let strings = rules.iter().map(rules_to_string).collect::<Vec<String>>();
+            let strings = rules.iter().map(|r| rules_to_string(r, regex_patterns)).collect::<Vec<String>>();
             let joined = strings.join(" && ");
             format!("({})", joined)
         }
@@ -434,15 +451,17 @@ fn rules_to_string(match_rule: &MatchRule) -> String {
             )
         }
         MatchRule::Regex(offset, pattern) => {
+            let pattern_index = get_or_add_regex_pattern(regex_patterns, pattern);
             format!(
-                "regex(bytes, {}, &Regex::new(\"{}\").unwrap())",
-                offset, pattern
+                "regex(bytes, {}, &REGEX_PATTERN_{})",
+                offset, pattern_index
             )
         }
         MatchRule::RegexRange(start, end, pattern) => {
+            let pattern_index = get_or_add_regex_pattern(regex_patterns, pattern);
             format!(
-                "regex_range(bytes, {}, {}, &Regex::new(\"{}\").unwrap())",
-                start, end, pattern
+                "regex_range(bytes, {}, {}, &REGEX_PATTERN_{})",
+                start, end, pattern_index
             )
         }
         MatchRule::ValueU32(offset, value) => {
@@ -477,6 +496,7 @@ type AliasType = (String, String);
 
 fn parse_definition_file(
     xml_path: &str,
+    regex_patterns: &mut Vec<String>,
 ) -> Result<(Vec<OutputMimeType>, Vec<AliasType>), Box<dyn std::error::Error>> {
     let rules = parse_mime_type_xml(xml_path)?;
     let mime_types = rules.mime_types;
@@ -491,7 +511,7 @@ fn parse_definition_file(
                 .iter()
                 .filter_map(|z| z.pattern.clone())
                 .collect(),
-            match_rules_string: rules_to_string(&actions_to_rules(mime)),
+            match_rules_string: rules_to_string(&actions_to_rules(mime), regex_patterns),
             subclasses: mime
                 .sub_classes
                 .iter()
@@ -528,11 +548,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut output_mime_types = vec![];
     let mut alias_types = vec![];
+    let mut regex_patterns = vec![];
 
     let xml_paths = &args[1..];
     for xml_path in xml_paths {
         println!("Processing file: {}", xml_path);
-        let (omt, at) = parse_definition_file(xml_path)?;
+        let (omt, at) = parse_definition_file(xml_path, &mut regex_patterns)?;
         output_mime_types.extend(omt);
         alias_types.extend(at);
     }
@@ -592,6 +613,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_vec();
         mime.children = children;
     }
+    
+
 
     // Sort by the number of children and then priority
     output_mime_types.sort_by(|a, b| {
@@ -612,6 +635,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         types: output_mime_types.to_vec(),
         type_map,
         ext_map,
+        regex_patterns,
     };
 
     let code = ctx.render_once().unwrap();
@@ -671,7 +695,8 @@ mod tests {
             MatchRule::String(0, [0x50, 0x4B, 0x07, 0x08].to_vec())
         );
 
-        let string_rules = rules_to_string(&rule);
+        let mut regex_patterns = vec![];
+        let string_rules = rules_to_string(&rule, &mut regex_patterns);
         assert_eq!(
             string_rules,
             "(offset(bytes, 0, &[80, 75, 3, 4]) || offset(bytes, 0, &[80, 75, 5, 6]) || offset(bytes, 0, &[80, 75, 7, 8]))"
@@ -726,7 +751,8 @@ mod tests {
             MatchRule::String(8, [174, 177, 83, 120, 208, 41, 150, 212].to_vec())
         );
 
-        let string_rules = rules_to_string(&rule);
+        let mut regex_patterns = vec![];
+        let string_rules = rules_to_string(&rule, &mut regex_patterns);
         assert_eq!(
             string_rules,
             "(offset(bytes, 0, &[228, 82, 92, 123]) && offset(bytes, 4, &[140, 216]) && offset(bytes, 6, &[167, 77]) && (offset(bytes, 8, &[174, 177, 83, 120, 208, 41, 150, 211]) || offset(bytes, 8, &[174, 177, 83, 120, 208, 41, 150, 212])))"
@@ -752,7 +778,8 @@ mod tests {
         let rule = actions_to_rules(&mime);
         dbg!(&rule);
 
-        let string_rules = rules_to_string(&rule);
+        let mut regex_patterns = vec![];
+        let string_rules = rules_to_string(&rule, &mut regex_patterns);
         assert_eq!(
             string_rules,
             "(T_zip_application{}.check(bytes) && T_zip2_application{}.check(bytes) && offset(bytes, 0, &[80, 75, 3, 4]) && offset(bytes, 30, &[109, 105, 109, 101, 116, 121, 112, 101, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 118, 110, 100, 46, 101, 116, 115, 105, 46, 97, 115, 105, 99, 45, 101, 43, 122, 105, 112]))"
@@ -795,7 +822,8 @@ mod tests {
         let rule = actions_to_rules(&mime);
         dbg!(&rule);
 
-        let string_rules = rules_to_string(&rule);
+        let mut regex_patterns = vec![];
+        let string_rules = rules_to_string(&rule, &mut regex_patterns);
         assert_eq!(
             string_rules,
             "(offset(bytes, 0, &[60, 63, 120, 109, 108]) || offset(bytes, 0, &[60, 63, 88, 77, 76]) || offset(bytes, 0, &[239, 187, 191, 60, 63, 120, 109, 108]) || offset(bytes, 0, &[255, 254, 60, 0, 63, 0, 120, 0, 109, 0, 108, 0]) || offset(bytes, 0, &[254, 255, 0, 60, 0, 63, 0, 120, 0, 109, 0, 108]) || offset(bytes, 0, &[60, 33, 45, 45]))"
@@ -816,7 +844,8 @@ mod tests {
         let rule = actions_to_rules(&mime);
         dbg!(&rule);
 
-        let string_rules = rules_to_string(&rule);
+        let mut regex_patterns = vec![];
+        let string_rules = rules_to_string(&rule, &mut regex_patterns);
         assert_eq!(
             string_rules,
             r#"(rootxml(bytes, "html", "http://www.w3.org/1999/xhtml") || rootxml_local(bytes, "html") || rootxml_namespace(bytes, "http://www.w3.org/1991/xhtml"))"#

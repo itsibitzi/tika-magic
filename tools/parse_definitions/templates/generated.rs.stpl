@@ -6,6 +6,11 @@
 use crate::magic::*;
 use regex::bytes::Regex;
 use phf::phf_map;
+use std::sync::LazyLock;
+
+<% for (i, pattern) in regex_patterns.iter().enumerate() { %>
+static REGEX_PATTERN_<%- i %>: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<%- pattern %>"#).unwrap());
+<% } %>
 
 <% for t in &types { %>
 pub(super) struct <%- t.short_name %>;
